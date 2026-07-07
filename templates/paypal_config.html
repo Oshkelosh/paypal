@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% from "_macros.html" import csrf_field with context %}
+
+{% block title %}PayPal Settings{% endblock %}
+
+{% block content %}
+<h1>PayPal Payments</h1>
+
+<div class="card">
+    <h2>Configuration</h2>
+    <form method="post" action="/admin/payments/paypal/save" class="form">
+        {{ csrf_field() }}
+        <div class="form-group">
+            <label for="client_id">Client ID</label>
+            <input type="password" id="client_id" name="client_id"
+                   value="{{ config.get('client_id', '') }}" />
+        </div>
+        <div class="form-group">
+            <label for="client_secret">Client Secret</label>
+            <input type="password" id="client_secret" name="client_secret"
+                   value="{{ config.get('client_secret', '') }}" />
+        </div>
+        <div class="form-group">
+            <label for="webhook_id">Webhook ID</label>
+            <input type="password" id="webhook_id" name="webhook_id"
+                   value="{{ config.get('webhook_id', '') }}" />
+        </div>
+        <div class="form-group">
+            <label for="environment">Environment</label>
+            <select id="environment" name="environment">
+                <option value="sandbox" {% if config.get('environment', 'sandbox') == 'sandbox' %}selected{% endif %}>Sandbox</option>
+                <option value="production" {% if config.get('environment') == 'production' %}selected{% endif %}>Production</option>
+            </select>
+        </div>
+        <div class="alert alert--info" style="margin-bottom:1em;">
+            Checkout redirects use your <a href="/admin/settings">Site URL</a> automatically.
+            Clear override fields below to use automatic URLs.
+        </div>
+        <details style="margin-bottom:1em;">
+            <summary>Advanced redirect URL overrides</summary>
+            <div class="form-group" style="margin-top:1em;">
+                <label for="return_url">Return URL override</label>
+                <input type="text" id="return_url" name="return_url"
+                       value="{{ config.get('return_url', '') }}"
+                       placeholder="Leave blank for automatic URL" />
+            </div>
+            <div class="form-group">
+                <label for="cancel_url">Cancel URL override</label>
+                <input type="text" id="cancel_url" name="cancel_url"
+                       value="{{ config.get('cancel_url', '') }}"
+                       placeholder="Leave blank for automatic URL" />
+            </div>
+        </details>
+        <div class="form-group">
+            <label>
+                <input type="checkbox" name="is_enabled" {% if addon and addon.is_enabled %}checked{% endif %} />
+                Enable this payment processor
+            </label>
+        </div>
+        <div class="form-actions">
+            <button type="submit" class="btn btn--primary">Save Configuration</button>
+        </div>
+    </form>
+</div>
+
+<div class="card" style="margin-top:1.5em;">
+    <h2>Webhook Endpoint</h2>
+    <code>{{ request.base_url }}api/v1/payments/paypal/webhook</code>
+</div>
+{% endblock %}
