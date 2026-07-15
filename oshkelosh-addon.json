@@ -5,5 +5,6 @@
   "category": "payment",
   "version": "1.0.0",
   "min_oshkelosh_version": "0.1.0",
-  "python_requires": ">=3.11"
+  "python_requires": ">=3.11",
+  "source_url": "https://github.com/Oshkelosh/paypal"
 }
