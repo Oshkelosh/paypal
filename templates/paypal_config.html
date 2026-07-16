@@ -69,11 +69,18 @@
     <p style="color:var(--clr-text-muted);margin:0 0 12px;font-size:14px;">
       Register this URL in the
       <a href="https://developer.paypal.com/" target="_blank" rel="noopener noreferrer">PayPal Developer Dashboard</a>
-      for your app. Select at least
-      <code>CHECKOUT.ORDER.APPROVED</code> and <code>PAYMENT.CAPTURE.COMPLETED</code>,
-      then paste the resulting Webhook ID into the field above.
+      for your app, then paste the resulting Webhook ID into the field above.
       The URL is derived from <code>PUBLIC_APP_URL</code> (currently
       <strong>{{ public_app_url }}</strong>).
+    </p>
+    <p style="color:var(--clr-text-muted);margin:0 0 12px;font-size:14px;">
+      Required events:
+      <code>CHECKOUT.ORDER.APPROVED</code> (triggers server-side capture) and
+      <code>PAYMENT.CAPTURE.COMPLETED</code> (marks the order paid).
+      Also register
+      <code>PAYMENT.CAPTURE.DENIED</code>,
+      <code>PAYMENT.CAPTURE.PENDING</code>, and
+      <code>CHECKOUT.PAYMENT-APPROVAL.REVERSED</code>.
     </p>
     <code>{{ webhook_url }}</code>
 </div>

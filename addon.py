@@ -6,17 +6,19 @@ Supports checkout orders, captures, refunds, and webhooks.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal
+import json
+import time
+from typing import Any, Dict, List, Literal, Mapping
 
 import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, SecretStr
 
+from app.addons.config_serialization import dump_addon_config
+from app.addons.log import info, warning
 from app.addons.payments.base import PaymentAddon
 from app.addons.payments.helpers import effective_redirect_url, extract_order_id, mock_checkout
 from schemas.payment import PaymentWebhookOutcome
-from app.addons.log import info, warning
-from app.addons.config_serialization import dump_addon_config
 
 PayPalEnvironment = Literal["sandbox", "production"]
 
@@ -24,6 +26,41 @@ _API_BASES: dict[PayPalEnvironment, str] = {
     "sandbox": "https://api-m.sandbox.paypal.com",
     "production": "https://api-m.paypal.com",
 }
+
+_TOKEN_REFRESH_SKEW_SECONDS = 60
+
+
+def _header_get(headers: Mapping[str, str], name: str) -> str:
+    lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lower:
+            return value
+    return ""
+
+
+def _resolve_internal_order_id(resource: dict[str, Any]) -> int | None:
+    """Resolve core order id from a PayPal webhook resource."""
+    metadata = dict(resource.get("metadata") or {})
+    if resource.get("custom_id"):
+        metadata.setdefault("order_id", resource["custom_id"])
+    units = resource.get("purchase_units") or []
+    if units and isinstance(units[0], dict) and units[0].get("custom_id"):
+        metadata.setdefault("order_id", units[0]["custom_id"])
+    return extract_order_id(metadata)
+
+
+def _paypal_order_id(resource: dict[str, Any]) -> str | None:
+    """PayPal Checkout Order id (not the core order id)."""
+    related = (
+        resource.get("supplementary_data", {})
+        .get("related_ids", {})
+        .get("order_id")
+    )
+    if related:
+        return str(related)
+    if resource.get("id"):
+        return str(resource["id"])
+    return None
 
 
 class PayPalConfig(BaseModel):
@@ -62,6 +99,7 @@ class PayPalAddon(PaymentAddon):
     _cancel_url: str = ""
     _api_base: str = _API_BASES["sandbox"]
     _access_token: str | None = None
+    _token_expires_at: float = 0.0
 
     @classmethod
     def config_schema(cls):
@@ -78,6 +116,7 @@ class PayPalAddon(PaymentAddon):
         self._cancel_url = validated.cancel_url
         self._api_base = _API_BASES[self._environment]
         self._access_token = None
+        self._token_expires_at = 0.0
         self.is_enabled = True
         info("PayPal", "Initialized (environment={})", self._environment)
 
@@ -111,10 +150,12 @@ class PayPalAddon(PaymentAddon):
         self._client_secret = None
         self._webhook_id = None
         self._access_token = None
+        self._token_expires_at = 0.0
         self.is_enabled = False
 
     async def _get_access_token(self) -> str:
-        if self._access_token:
+        now = time.monotonic()
+        if self._access_token and now < self._token_expires_at:
             return self._access_token
         if not self._client_id or not self._client_secret:
             raise RuntimeError("PayPal credentials not configured")
@@ -127,7 +168,10 @@ class PayPalAddon(PaymentAddon):
                 headers={"Accept": "application/json"},
             )
             resp.raise_for_status()
-            self._access_token = resp.json()["access_token"]
+            data = resp.json()
+            self._access_token = data["access_token"]
+            expires_in = int(data.get("expires_in", 32400))
+            self._token_expires_at = now + max(expires_in - _TOKEN_REFRESH_SKEW_SECONDS, 60)
             return self._access_token
 
     async def _request(
@@ -207,7 +251,7 @@ class PayPalAddon(PaymentAddon):
             }
         except Exception as exc:
             warning("PayPal", "create_payment error: {}", exc)
-            return mock_checkout("paypal", order_id, amount, currency)
+            return {"success": False, "error": str(exc), "order_id": order_id}
 
     async def confirm_payment(self, payment_id: str) -> Dict[str, Any]:
         if not self._client_id:
@@ -221,9 +265,11 @@ class PayPalAddon(PaymentAddon):
                 .get("payments", {})
                 .get("captures", [{}])[0]
             )
+            capture_id = capture.get("id") or payment_id
             return {
                 "success": status == "COMPLETED",
                 "payment_id": payment_id,
+                "capture_id": capture_id,
                 "status": status.lower(),
                 "amount": int(float(capture.get("amount", {}).get("value", 0)) * 100),
             }
@@ -235,10 +281,14 @@ class PayPalAddon(PaymentAddon):
         if not self._client_id:
             return {"success": False, "error": "PayPal credentials not configured"}
 
-        body = {
-            "amount": {"value": f"{amount / 100:.2f}", "currency_code": "USD"},
-        }
         try:
+            capture = await self._request("GET", f"/v2/payments/captures/{payment_id}")
+            currency = (
+                capture.get("amount", {}).get("currency_code") or "USD"
+            ).upper()
+            body = {
+                "amount": {"value": f"{amount / 100:.2f}", "currency_code": currency},
+            }
             data = await self._request(
                 "POST",
                 f"/v2/payments/captures/{payment_id}/refund",
@@ -285,30 +335,120 @@ class PayPalAddon(PaymentAddon):
     def webhook_signature_header(self) -> str:
         return "paypal-transmission-id"
 
+    async def verify_webhook(
+        self,
+        *,
+        headers: Mapping[str, str],
+        body: bytes,
+    ) -> bool:
+        """Verify a PayPal webhook via the notifications verify API."""
+        if not self._webhook_id or not self._client_id:
+            warning("PayPal", "verify_webhook skipped: webhook_id or credentials missing")
+            return False
+
+        transmission_id = _header_get(headers, "paypal-transmission-id")
+        transmission_time = _header_get(headers, "paypal-transmission-time")
+        transmission_sig = _header_get(headers, "paypal-transmission-sig")
+        cert_url = _header_get(headers, "paypal-cert-url")
+        auth_algo = _header_get(headers, "paypal-auth-algo")
+        if not all(
+            (transmission_id, transmission_time, transmission_sig, cert_url, auth_algo)
+        ):
+            warning("PayPal", "verify_webhook missing required PayPal headers")
+            return False
+
+        try:
+            webhook_event = json.loads(body.decode("utf-8"))
+            result = await self._request(
+                "POST",
+                "/v1/notifications/verify-webhook-signature",
+                json_body={
+                    "transmission_id": transmission_id,
+                    "transmission_time": transmission_time,
+                    "cert_url": cert_url,
+                    "auth_algo": auth_algo,
+                    "transmission_sig": transmission_sig,
+                    "webhook_id": self._webhook_id,
+                    "webhook_event": webhook_event,
+                },
+            )
+            status = result.get("verification_status", "")
+            ok = status == "SUCCESS"
+            if not ok:
+                warning("PayPal", "verify_webhook status={}", status)
+            return ok
+        except Exception as exc:
+            warning("PayPal", "verify_webhook error: {}", exc)
+            return False
+
     async def parse_webhook(
         self, payload: Dict[str, Any], signature: str
     ) -> PaymentWebhookOutcome:
         try:
             event_type = payload.get("event_type", "")
             event_data = payload.get("resource", payload)
+            if not isinstance(event_data, dict):
+                event_data = {}
             event_id = str(payload.get("id", ""))
             info("PayPal", "Webhook received: {}", event_type)
 
-            if event_type in ("CHECKOUT.ORDER.APPROVED", "PAYMENT.CAPTURE.COMPLETED"):
-                metadata = dict(event_data.get("metadata") or {})
-                if event_data.get("custom_id"):
-                    metadata.setdefault("order_id", event_data["custom_id"])
-                order_id = extract_order_id(metadata)
-                payment_id = event_data.get("id") or event_data.get("supplementary_data", {}).get(
-                    "related_ids", {}
-                ).get("order_id")
+            if event_type == "CHECKOUT.ORDER.APPROVED":
+                paypal_order_id = _paypal_order_id(event_data)
+                if not paypal_order_id:
+                    warning("PayPal", "APPROVED webhook missing PayPal order id")
+                    return PaymentWebhookOutcome(
+                        handled=True,
+                        event_id=event_id,
+                        event_type=event_type,
+                    )
+                capture = await self.confirm_payment(paypal_order_id)
+                if not capture.get("success"):
+                    warning(
+                        "PayPal",
+                        "capture after APPROVED failed for {}: {}",
+                        paypal_order_id,
+                        capture.get("error"),
+                    )
+                return PaymentWebhookOutcome(
+                    handled=True,
+                    event_id=event_id,
+                    event_type=event_type,
+                    mark_paid=False,
+                    payment_id=paypal_order_id,
+                )
+
+            if event_type == "PAYMENT.CAPTURE.COMPLETED":
+                order_id = _resolve_internal_order_id(event_data)
+                capture_id = event_data.get("id")
+                paypal_order_id = (
+                    event_data.get("supplementary_data", {})
+                    .get("related_ids", {})
+                    .get("order_id")
+                )
                 return PaymentWebhookOutcome(
                     handled=True,
                     event_id=event_id,
                     event_type=event_type,
                     mark_paid=order_id is not None,
                     order_id=order_id,
-                    payment_id=str(payment_id) if payment_id else None,
+                    payment_id=str(paypal_order_id) if paypal_order_id else (
+                        str(capture_id) if capture_id else None
+                    ),
+                    payment_charge_id=str(capture_id) if capture_id else None,
+                )
+
+            if event_type in (
+                "PAYMENT.CAPTURE.DENIED",
+                "PAYMENT.CAPTURE.PENDING",
+                "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+            ):
+                warning("PayPal", "Non-success payment event: {}", event_type)
+                return PaymentWebhookOutcome(
+                    handled=True,
+                    event_id=event_id,
+                    event_type=event_type,
+                    mark_paid=False,
+                    order_id=_resolve_internal_order_id(event_data),
                 )
 
             return PaymentWebhookOutcome(
